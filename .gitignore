@@ -1,0 +1,21 @@
+# 构建产物
+build/
+dist/
+installer/output/
+__pycache__/
+*.pyc
+
+# 本地资产，体积太大不进仓库（获取方式见 README「构建」一节）
+runtime/
+models/*.bin
+models/*.gguf
+
+# 本机配置，不要提交
+config.json
+
+# 系统
+Thumbs.db
+.DS_Store
+
+# AI 助手的项目数据与预览图，不属于源码
+.workbuddy-ai/

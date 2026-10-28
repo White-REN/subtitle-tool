@@ -1,0 +1,6 @@
+# 运行和构建只依赖这一个第三方包，其余都是标准库
+sudachipy>=0.6.11
+sudachidict_core>=20230927
+
+# 打包
+pyinstaller>=6.0
