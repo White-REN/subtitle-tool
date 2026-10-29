@@ -150,6 +150,51 @@ def merge_segments(segments, max_gap_ms=1000):
     return merged
 
 
+def fill_gaps(segments, min_gap_ms=8000, chunk_ms=20000):
+    """把过长的「非语音」空洞也补成待识别区段。
+
+    Silero VAD 在有背景音乐的对白上会失效。实测 46 分钟的正片，VAD 只
+    标出 61% 的音频，剩下 39% 里最长一段有 2 分钟——而那 2 分钟里是
+    完整的对话，whisper 直接识别就能出句子。
+
+    更麻烦的是它的结果还跟切片起点有关：同一段音频，从 2000 秒开始切
+    就整段漏掉，从 2100 秒开始切就正常检出。所以不能只靠 VAD 决定
+    「哪里有人说话」。
+
+    做法：空洞超过 min_gap_ms 就当成可疑区域，切成 chunk_ms 的块交给
+    whisper。纯音乐/静音的部分 whisper 会返回空，后面自然会被过滤掉。
+    """
+
+    if not segments:
+        return segments
+
+    filled = list(segments)
+
+    for index in range(len(segments) - 1):
+
+        end = segments[index][1]
+        next_start = segments[index + 1][0]
+
+        if next_start - end < min_gap_ms:
+            continue
+
+        cursor = end
+
+        while cursor < next_start:
+
+            chunk_end = min(
+                cursor + chunk_ms,
+                next_start,
+            )
+
+            filled.append((cursor, chunk_end))
+            cursor = chunk_end
+
+    filled.sort()
+
+    return filled
+
+
 # =========================
 # 3. 生成 Whisper 上下文窗口
 # =========================
@@ -344,6 +389,17 @@ if __name__ == "__main__":
     print(
         f"合并后剩余 {len(merged)} 个区域"
     )
+
+    # VAD 漏掉的对白：把长空洞也补进来，交给 whisper 判断
+    filled = fill_gaps(merged)
+
+    if len(filled) > len(merged):
+        print(
+            f"补充 {len(filled) - len(merged)} 个疑似区域"
+            f"（VAD 在背景音乐下会漏检）"
+        )
+
+    merged = filled
 
     for i, (start, end) in enumerate(merged):
         print(

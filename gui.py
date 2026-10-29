@@ -44,7 +44,7 @@ FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
 
 APP_TITLE = "Subtitle Tool"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1.0"
 
 RADIUS = 10       # 卡片
 RADIUS_CTRL = 6   # 控件

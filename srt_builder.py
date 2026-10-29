@@ -65,6 +65,31 @@ def format_time(seconds):
 # Whisper JSON
 # ============================================================
 
+def redistribute(text, start, end):
+    """把一段文字按字符均分到 [start, end] 时间区间上。
+
+    whisper 在长片段上偶尔会把除前几个之外的所有 token 都标成同一时刻
+    （零长度）。这时候与其丢掉整段，不如按字数均分——时间不精确，
+    但内容还在，观众至少看得到字幕。
+    """
+
+    chars = list(text)
+
+    if not chars or end <= start:
+        return []
+
+    step = (end - start) / len(chars)
+
+    return [
+        {
+            "text": char,
+            "start": start + index * step,
+            "end": start + (index + 1) * step,
+        }
+        for index, char in enumerate(chars)
+    ]
+
+
 def load_tokens(json_file):
     """读取 Whisper JSON 中的真实文本 token。"""
 
@@ -74,6 +99,8 @@ def load_tokens(json_file):
     tokens = []
 
     for segment in data.get("transcription", []):
+
+        raw = []
 
         for token in segment.get("tokens", []):
 
@@ -100,14 +127,46 @@ def load_tokens(json_file):
                 / 1000
             )
 
-            if end <= start:
-                continue
-
-            tokens.append({
+            raw.append({
                 "text": text,
                 "start": start,
                 "end": end,
             })
+
+        if not raw:
+            continue
+
+        valid = [
+            token for token in raw
+            if token["end"] > token["start"]
+        ]
+
+        # ----------------------------------------------------
+        # 时间戳退化检测
+        #
+        # 正常的 token 覆盖应该接近整段文字。如果有效 token 的文字量
+        # 明显少于整段，说明 whisper 把大部分 token 标成了零长度，
+        # 直接过滤会把整段内容丢掉（实测丢过一整句 12 秒的旁白）。
+        # ----------------------------------------------------
+
+        full_text = "".join(token["text"] for token in raw)
+        valid_text = "".join(token["text"] for token in valid)
+
+        if len(valid_text) < len(full_text) * 0.8:
+
+            offsets = segment.get("offsets", {})
+
+            tokens.extend(
+                redistribute(
+                    full_text,
+                    offsets.get("from", 0) / 1000,
+                    offsets.get("to", 0) / 1000,
+                )
+            )
+
+        else:
+
+            tokens.extend(valid)
 
     return tokens
 
@@ -477,6 +536,38 @@ def tokenize_words(tokens):
 # 断点评分
 # ============================================================
 
+# ============================================================
+# 断点相关词表
+# ============================================================
+
+# 句末标点：断在这里最自然
+STRONG_END = {"。", "．", "？", "?", "！", "!", "…"}
+
+# 读点：语气停顿，适合断
+WEAK_END = {"、", "，", ","}
+
+# 接续词：后面通常开始新的一层意思
+CONTINUATIONS = {
+    "しかし", "そして", "また", "ただ", "でも", "ところが", "つまり",
+    "さらに", "なお", "一方", "ところで", "ちなみに", "ただし",
+    "それでも", "だから", "ですから", "なぜなら", "たとえば",
+    "すると", "そこで", "それに", "そのうえ", "および", "またしても",
+}
+
+# 助数词：前面是数字时不能切开（9 月、246 万 6000 人）
+COUNTERS = {
+    "月", "日", "年", "人", "回", "時", "分", "秒", "個", "件", "位",
+    "歳", "度", "番", "号", "階", "軒", "台", "枚", "冊", "匹", "頭",
+    "羽", "円", "名", "割", "倍", "周", "期", "時半",
+}
+
+# サ変動詞的后半截：名词 + する 不能切开（合祀 + する）
+SURU_FORMS = {"する", "し", "した", "して", "される", "され", "させる", "でき"}
+
+# 补助动词：て + いる / しまう 不能切开
+AUX_VERBS = {"いる", "いた", "しまう", "しまった", "おく", "みる", "くる", "いく"}
+
+
 def break_score(
     left_words,
     right_words,
@@ -493,6 +584,55 @@ def break_score(
     right_pos = right["pos"]
 
     score = 0
+
+    # --------------------------------------------------------
+    # 标点：最强的断点信号
+    #
+    # 之前完全没有处理标点，导致「、」经常落在字幕中间，
+    # 甚至跑到下一条的开头。
+    # --------------------------------------------------------
+
+    if left_text in STRONG_END:
+        score += 150
+
+    elif left_text in WEAK_END:
+        score += 80
+
+    # 标点不能出现在下一条开头
+    if right_text in STRONG_END or right_text in WEAK_END:
+        score -= 250
+
+    # --------------------------------------------------------
+    # 接续词：后面断，前面不断
+    # --------------------------------------------------------
+
+    if left_text in CONTINUATIONS:
+        score += 90
+
+    if right_text in CONTINUATIONS:
+        score -= 150
+
+    # --------------------------------------------------------
+    # 数字 + 助数词 不能切开
+    # --------------------------------------------------------
+
+    is_number = "数詞" in left_pos or left_text.isdigit()
+    if is_number and right_text in COUNTERS:
+        score -= 250
+
+    # --------------------------------------------------------
+    # 名词 + する（サ変動詞）不能切开
+    # --------------------------------------------------------
+
+    if "名詞" in left_pos and right_text in SURU_FORMS:
+        score -= 150
+
+    # --------------------------------------------------------
+    # て + 补助动词 不能切开
+    # --------------------------------------------------------
+
+    if left_text in {"て", "で"} and right_text in AUX_VERBS:
+        score -= 150
 
     # --------------------------------------------------------
     # 强烈禁止：
@@ -541,6 +681,13 @@ def break_score(
         "し",
     }:
         score += 50
+
+    # --------------------------------------------------------
+    # 句尾是助动词（です / ます / た），句子大概率结束
+    # --------------------------------------------------------
+
+    if "助動詞" in left_pos:
+        score += 30
 
     # --------------------------------------------------------
     # 名词后面通常比较容易断
@@ -680,49 +827,41 @@ def split_tokens(
     # Sudachi word -> Whisper token
     # ========================================================
 
-    result = []
+    # 先算出每个 token 在原文里的字符区间
+    spans = []
+    cursor = 0
 
-    for word_group in groups:
+    for token in tokens:
+        token_text = token["text"]
+        spans.append((token, cursor, cursor + len(token_text)))
+        cursor += len(token_text)
 
-        start_char = (
-            word_group[0]["start_char"]
-        )
+    result = [[] for _ in groups]
 
-        end_char = (
-            word_group[-1]["end_char"]
-        )
+    for token, token_start, _token_end in spans:
 
-        matched = []
+        # 空格 token 不参与字幕
+        if not token["text"].strip():
+            continue
 
-        cursor = 0
+        # 按 token 的「起点」归组，一个 token 只进一组。
+        #
+        # 之前的写法是判断区间有交集，结果跨组边界的 token 会被
+        # 前后两组同时收下，文本就重复了——「されています」被切成
+        # 两组时会出现「されてれています」这种鬼东西。
+        for index, word_group in enumerate(groups):
 
-        for token in tokens:
+            group_start = word_group[0]["start_char"]
+            group_end = word_group[-1]["end_char"]
 
-            token_text = token["text"]
+            if group_start <= token_start < group_end:
+                result[index].append(token)
+                break
 
-            token_start = cursor
-            token_end = (
-                cursor
-                + len(token_text)
-            )
-
-            cursor = token_end
-
-            # 空格 token 不参与字幕，但仍然推进字符位置
-            if token_text.strip() == "":
-                continue
-
-            if (
-                token_end > start_char
-                and
-                token_start < end_char
-            ):
-                matched.append(token)
-
-        if matched:
-            result.append(matched)
-
-    return result
+    return [
+        group for group in result
+        if group
+    ]
 
 
 # ============================================================
@@ -1325,6 +1464,114 @@ def deduplicate_subtitles(subtitles):
 # 时间优化
 # ============================================================
 
+# whisper 在音乐、静音、片尾这些没有人声的地方，会凭空生成一批固定句子。
+# 补洞之后这种情况会变多，必须滤掉，否则字幕里会冒出莫名其妙的「感谢观看」。
+HALLUCINATIONS = {
+    "ご視聴ありがとうございました",
+    "ご視聴いただきありがとうございました",
+    "最後までご視聴いただきありがとうございました",
+    "ご視聴ありがとうございます",
+    "チャンネル登録お願いします",
+    "チャンネル登録よろしくお願いします",
+    "字幕は自動生成されています",
+    "自動字幕",
+}
+
+
+def is_hallucination(text):
+    """判断是不是 whisper 的固定幻听。
+
+    只匹配下面这几个完整片段——单独一个「ありがとうございました」
+    是正常对白，不能误删。
+    """
+
+    normalized = re.sub(r"[\s、。，．!?！？「」…]", "", text)
+
+    # 用「包含」而不是「整句相等」：幻听经常带前后缀，
+    # 比如「残念で阿部ご視聴ありがとうございました」「…ありがとうございましたん」。
+    # 这几个片段足够特殊，正常对白里不会出现。
+    return any(
+        pattern in normalized
+        for pattern in HALLUCINATIONS
+    )
+
+
+def drop_hallucinations(subtitles):
+    kept = [s for s in subtitles if not is_hallucination(s["text"])]
+
+    removed = len(subtitles) - len(kept)
+
+    if removed:
+        print(f"滤掉 {removed} 条幻听字幕")
+
+    return kept
+
+
+def resolve_overlaps(subtitles):
+    """消解相邻字幕的时间重叠。
+
+    正常的字幕是首尾相接的（前一条结束 = 后一条开始），真正重叠的
+    几乎都是相邻窗口把同一段语音转写了两遍，两条说的是一回事，
+    一起显示只会闪来闪去。
+
+    规则：重叠且文字相近 → 丢掉字数少的那条；
+          重叠但内容确实不同 → 把前一条的结束时间收回来。
+    """
+
+    if not subtitles:
+        return []
+
+    subtitles = sorted(
+        subtitles,
+        key=lambda x: (x["start"], x["end"]),
+    )
+
+    result = [subtitles[0]]
+
+    for current in subtitles[1:]:
+
+        previous = result[-1]
+
+        overlap = previous["end"] - current["start"]
+
+        # 首尾相接不算重叠
+        if overlap <= 0.05:
+            result.append(current)
+            continue
+
+        previous_duration = max(0.1, previous["end"] - previous["start"])
+        current_duration = max(0.1, current["end"] - current["start"])
+
+        overlap_ratio = overlap / min(previous_duration, current_duration)
+
+        same_line = (
+            subtitle_similarity(previous, current) >= 0.35
+            or previous["text"] in current["text"]
+            or current["text"] in previous["text"]
+        )
+
+        if same_line and overlap_ratio >= 0.3:
+
+            # 说的是同一句话，留信息量大的那条
+            if len(current["text"]) > len(previous["text"]):
+                result[-1] = current
+            continue
+
+        # 内容不同：把前一条收回来。
+        # 收完如果短到看不清（不到 0.6 秒），说明它本来就是被挤出来的
+        # 碎片，直接丢掉，别留一条一闪而过的字幕。
+        trimmed_end = current["start"]
+
+        if trimmed_end - previous["start"] < 0.6:
+            result.pop()
+        else:
+            previous["end"] = trimmed_end
+
+        result.append(current)
+
+    return result
+
+
 def optimize_timing(subtitles):
     if not subtitles:
         return []
@@ -1340,7 +1587,11 @@ def optimize_timing(subtitles):
 
     MIN_DURATION = 1.0
     MAX_DURATION = 7.0
-    MIN_GAP = 0.05
+
+    # 每秒最多读几个字。日语字幕的通行区间是 4~6，
+    # 超过 6 观众就跟不上了。用它反推「这条字幕至少得显示多久」，
+    # 比固定 1.0 秒合理得多——14 个字塞进 1 秒根本看不清。
+    MAX_CPS = 5.5
 
     result = []
 
@@ -1349,15 +1600,22 @@ def optimize_timing(subtitles):
         start = subtitle["start"]
         end = subtitle["end"]
 
+        text = subtitle["text"]
         duration = end - start
+
+        # 按字数算出需要的显示时长
+        needed = max(
+            MIN_DURATION,
+            len(text) / MAX_CPS,
+        )
 
         # ----------------------------------------------------
         # 太短
         # ----------------------------------------------------
 
-        if duration < MIN_DURATION:
+        if duration < needed:
 
-            end = start + MIN_DURATION
+            end = start + needed
 
         # ----------------------------------------------------
         # 太长
@@ -1370,7 +1628,7 @@ def optimize_timing(subtitles):
         result.append({
             "start": start,
             "end": end,
-            "text": subtitle["text"],
+            "text": text,
         })
 
     # --------------------------------------------------------
@@ -1422,7 +1680,11 @@ def merge_subtitles(subtitles):
     result = []
 
     # 合并后的最大字符数
-    MAX_CHARS = 32
+    #
+    # 日语字幕单行 20 字是通行上限，超过就得折行或者顶到屏幕边缘。
+    # 之前是 32（为了让翻译拿到完整句子），但代价是 28/38 条字幕
+    # 都超宽。翻译单元应该另外处理，显示先按标准来。
+    MAX_CHARS = 20
 
     # 两条字幕之间最多允许的间隔
     MAX_GAP = 0.35
@@ -1569,6 +1831,52 @@ def merge_subtitles(subtitles):
 # SRT 输出
 # ============================================================
 
+# ============================================================
+# 折行
+# ============================================================
+
+LINE_MAX = 20
+
+
+def wrap_lines(text, limit=LINE_MAX):
+    """把过长的字幕折成两行。
+
+    日语字幕单行超过 20 字就会顶到屏幕边缘，播放器自己折行的话
+    往往断在很难看的位置（比如词中间、助词前后）。这里主动在标点
+    或助词后面断开，并且保证两行长度不会太失衡。
+    """
+
+    if len(text) <= limit:
+        return [text]
+
+    middle = len(text) // 2
+
+    # 每行至少占四分之一，避免折出「7 字 + 25 字」这种畸形
+    min_line = max(5, len(text) // 4)
+    upper = len(text) - min_line
+
+    def pick(predicate):
+        """在所有合法断点里，选离中点最近的那个。"""
+        options = [
+            pos for pos in range(min_line, upper + 1)
+            if predicate(pos)
+        ]
+        return min(options, key=lambda pos: abs(pos - middle)) if options else None
+
+    # 1. 标点后面（最自然）
+    pos = pick(lambda p: text[p - 1] in "、。，．！？…")
+    if pos is not None:
+        return [text[:pos], text[pos:]]
+
+    # 2. 助词后面（日语里最常见的语义边界）
+    pos = pick(lambda p: text[p - 1] in "はがをにでとものもやへからまで")
+    if pos is not None:
+        return [text[:pos], text[pos:]]
+
+    # 3. 兜底：对半开
+    return [text[:middle], text[middle:]]
+
+
 def write_srt(
     subtitles,
     output_file,
@@ -1596,9 +1904,10 @@ def write_srt(
                 f"{format_time(subtitle['end'])}\n"
             )
 
-            f.write(
-                f"{subtitle['text']}\n\n"
-            )
+            for line in wrap_lines(subtitle["text"]):
+                f.write(f"{line}\n")
+
+            f.write("\n")
 
 
 # ============================================================
@@ -1802,6 +2111,14 @@ def main(video_name=None):
 
     print(
         "\n=== 时间优化 ==="
+    )
+
+    subtitles = drop_hallucinations(
+        subtitles
+    )
+
+    subtitles = resolve_overlaps(
+        subtitles
     )
 
     subtitles = optimize_timing(

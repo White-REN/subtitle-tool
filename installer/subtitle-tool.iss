@@ -14,7 +14,7 @@
 ;   %LOCALAPPDATA%\SubtitleTool\models
 
 #define AppName        "Subtitle Tool"
-#define AppVersion     "1.0.0"
+#define AppVersion     "1.1.0"
 #define AppPublisher   "REN"
 #define AppExeName     "SubtitleTool.exe"
 #define AppId          "{{7C4E2B18-9D3A-4F62-8E15-2B7A6C0D9F31}"
